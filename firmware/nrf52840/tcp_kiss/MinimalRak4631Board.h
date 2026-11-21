@@ -27,9 +27,27 @@ public:
     NRF_POWER->DCDCEN = 1;
 
     pinMode(PIN_VBAT_READ, INPUT);
+
+    // Deassert SX1262 CS, power on SX126X_POWER_EN (37), and pulse P_LORA_RESET (38)
+    // cleanly before SPI and RadioLib initialize the transceiver.
+    pinMode(P_LORA_NSS, OUTPUT);
+    digitalWrite(P_LORA_NSS, HIGH);
+    pinMode(P_LORA_BUSY, INPUT);
+
     pinMode(SX126X_POWER_EN, OUTPUT);
     digitalWrite(SX126X_POWER_EN, HIGH);
+    delay(20);
+
+    pinMode(P_LORA_RESET, OUTPUT);
+    digitalWrite(P_LORA_RESET, LOW);
     delay(10);
+    digitalWrite(P_LORA_RESET, HIGH);
+    delay(20);
+
+    const uint32_t busyStart = millis();
+    while (digitalRead(P_LORA_BUSY) && (uint32_t)(millis() - busyStart) < 50UL) {
+      delay(1);
+    }
   }
 
   uint16_t getBattMilliVolts() override {

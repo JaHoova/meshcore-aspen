@@ -186,11 +186,89 @@ static bool probeW5100sSpi() {
   return ver == 0x51;
 }
 
-// Live SPI probe of SX1262 GetStatus command (chip mode bits [6:4] must be 2..6).
-static bool probeSx1262Spi() {
-  const uint8_t st = radio.getStatus();
+// Direct BUSY-aware SX1262 GetStatus (0xC0) SPI transfer.
+// RadioLib 7.7.1 SX126x::getStatus() passes numBytes=0 to SPIreadStream(),
+// which copies 0 bytes and always returns 0x00; query 0xC0 directly on loraSpi.
+static bool readSx1262StatusRaw(uint8_t* outStatus) {
+  const uint32_t waitStart = millis();
+  while (digitalRead(P_LORA_BUSY)) {
+    if ((uint32_t)(millis() - waitStart) >= 50UL) {
+      *outStatus = 0x00u;
+      return false;
+    }
+    yield();
+  }
+
+  uint8_t tx[2] = {RADIOLIB_SX126X_CMD_GET_STATUS, RADIOLIB_SX126X_CMD_NOP};
+  uint8_t rx[2] = {0x00u, 0x00u};
+  loraSpi.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(P_LORA_NSS, LOW);
+  loraSpi.transfer(tx, rx, sizeof(tx));
+  digitalWrite(P_LORA_NSS, HIGH);
+  loraSpi.endTransaction();
+
+  *outStatus = rx[1];
+  return true;
+}
+
+// Live SPI probe of SX1262 GetStatus (chip mode bits [6:4] must be 2..6).
+static bool probeSx1262Spi(uint8_t* outStatus = nullptr) {
+  uint8_t st = 0;
+  if (!readSx1262StatusRaw(&st)) {
+    if (outStatus) {
+      *outStatus = 0x00u;
+    }
+    return false;
+  }
+  if (outStatus) {
+    *outStatus = st;
+  }
   const uint8_t chipMode = (uint8_t)((st >> 4) & 0x07u);
   return (st != 0x00u && st != 0xFFu && chipMode >= 2u && chipMode <= 6u);
+}
+
+static bool initSx1262Radio() {
+  loraSpi.setPins(P_LORA_MISO, P_LORA_SCLK, P_LORA_MOSI);
+  loraSpi.begin();
+
+  float tcxo = SX126X_DIO3_TCXO_VOLTAGE;
+  int16_t status = radio.begin(
+      LORA_FREQ, LORA_BW, LORA_SF, LORA_CR,
+      RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, false);
+  Serial.printf("[RADIO] radio.begin(tcxo=1.8V) -> %d\n", (int)status);
+
+  if (status == RADIOLIB_ERR_SPI_CMD_FAILED || status == RADIOLIB_ERR_SPI_CMD_INVALID) {
+    tcxo = 0.0f;
+    status = radio.begin(
+        LORA_FREQ, LORA_BW, LORA_SF, LORA_CR,
+        RADIOLIB_SX126X_SYNC_WORD_PRIVATE, LORA_TX_POWER, 16, tcxo, false);
+    Serial.printf("[RADIO] radio.begin(tcxo=0.0V fallback) -> %d\n", (int)status);
+  }
+
+  uint8_t rawStatus = 0;
+  const bool statusOk = readSx1262StatusRaw(&rawStatus);
+  Serial.printf("[RADIO] Raw GetStatus(0xC0)=0x%02X (mode=%u, busy=%d, ok=%u) DeviceErrors=0x%04X\n",
+                (unsigned)rawStatus,
+                (unsigned)((rawStatus >> 4) & 0x07u),
+                (int)digitalRead(P_LORA_BUSY),
+                statusOk ? 1u : 0u,
+                (unsigned)radio.getDeviceErrors());
+
+  if (status != RADIOLIB_ERR_NONE) {
+    return false;
+  }
+
+  radio.setCRC(1);
+#ifdef SX126X_CURRENT_LIMIT
+  radio.setCurrentLimit(SX126X_CURRENT_LIMIT);
+#endif
+#ifdef SX126X_DIO2_AS_RF_SWITCH
+  radio.setDio2AsRfSwitch(SX126X_DIO2_AS_RF_SWITCH);
+#endif
+#ifdef SX126X_RX_BOOSTED_GAIN
+  radio.setRxBoostedGainMode(SX126X_RX_BOOSTED_GAIN);
+#endif
+  return true;
 }
 
 static void stopActiveClients(const char* reason) {
@@ -614,7 +692,7 @@ void setup() {
   board.begin();
 
   // Initialize SX1262 LoRa radio on dedicated loraSpi (NRF_SPIM3 -> internal LoRa pins).
-  if (!radio.std_init(&loraSpi)) {
+  if (!initSx1262Radio()) {
     Serial.println("[RADIO] FATAL: SX1262 init failed; waiting for WDT reset");
     Serial.flush();
     while (true) {
@@ -697,9 +775,11 @@ void loop() {
   if ((uint32_t)(now - lastHealthCheckMs) >= HEALTH_CHECK_INTERVAL_MS) {
     lastHealthCheckMs = now;
     if (!modem.isActuallyTransmitting()) {
-      radioSpiHealthy = probeSx1262Spi();
+      uint8_t rawStatus = 0;
+      radioSpiHealthy = probeSx1262Spi(&rawStatus);
       if (!radioSpiHealthy) {
-        Serial.println("[WDT] SX1262 SPI unresponsive; withholding WDT feed");
+        Serial.printf("[WDT] SX1262 SPI unresponsive (GetStatus=0x%02X, busy=%d); withholding WDT feed\n",
+                      (unsigned)rawStatus, (int)digitalRead(P_LORA_BUSY));
       }
     }
     ethSpiHealthy = probeW5100sSpi();
